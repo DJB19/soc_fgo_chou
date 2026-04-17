@@ -1,44 +1,90 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
-#include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
-#include <gtsam/nonlinear/Marginals.h>
+#include <gtsam/nonlinear/Values.h>
 #include <gtsam/slam/PriorFactor.h>
-#include <gtsam/slam/BetweenFactor.h>
-#include <gtsam/geometry/Pose2.h>
 #include <gtsam/inference/Symbol.h>
 
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <filesystem>
 
 using namespace std;
 using namespace gtsam;
+namespace fs = std::filesystem;
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        cout << "❗用法: ./soc_fgo <输入CSV路径>" << endl;
+        return 1;
+    }
+
+    string csv_path = argv[1];
+    ifstream file(csv_path);
+    if (!file.is_open()) {
+        cerr << "❌ 无法打开文件: " << csv_path << endl;
+        return 1;
+    }
+
+    vector<double> time, voltage, current, soc_true, soc_kf;
+
+    string line;
+    getline(file, line); // 跳过表头
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string cell;
+        vector<string> tokens;
+        while (getline(ss, cell, ',')) tokens.push_back(cell);
+        if (tokens.size() < 5) continue;
+
+        time.push_back(stod(tokens[0]));
+        voltage.push_back(stod(tokens[1]));
+        current.push_back(stod(tokens[2]));
+        soc_true.push_back(stod(tokens[3]));
+        soc_kf.push_back(stod(tokens[4]));
+    }
+    file.close();
+
+    size_t N = time.size();
+    cout << "✅ 已读取数据点数量: " << N << endl;
+
     NonlinearFactorGraph graph;
-
-    // 创建变量 symbol：x0, x1
-    Symbol x0('x', 0);
-    Symbol x1('x', 1);
-
-    // 添加先验因子：x0 ≈ 0
-    auto priorNoise = noiseModel::Diagonal::Sigmas(Vector1(0.1));
-    graph.add(PriorFactor<double>(x0, 0.0, priorNoise));
-
-    // 添加 x0 与 x1 的相对因子：x1 = x0 + 1
-    auto betweenNoise = noiseModel::Diagonal::Sigmas(Vector1(0.1));
-    graph.add(BetweenFactor<double>(x0, x1, 1.0, betweenNoise));
-
-    // 初始估计
     Values initial;
-    initial.insert(x0, 0.5);  // 错一点没关系
-    initial.insert(x1, 1.8);  // 错一点没关系
 
-    // 优化
+    auto priorNoise = noiseModel::Isotropic::Sigma(1, 0.01);
+    auto smoothNoise = noiseModel::Isotropic::Sigma(1, 0.05);
+
+    Symbol x0('x', 0);
+    graph.add(PriorFactor<double>(x0, soc_kf[0], priorNoise));
+    initial.insert(x0, soc_kf[0]);
+
+    for (size_t i = 1; i < N; ++i) {
+        Symbol x_prev('x', i - 1);
+        Symbol x_curr('x', i);
+        double dt = time[i] - time[i - 1];
+        double delta_soc = -current[i - 1] * dt / 3600.0 / 27.0;
+        double predicted = soc_kf[i - 1] + delta_soc;
+        graph.add(PriorFactor<double>(x_curr, predicted, smoothNoise));
+        initial.insert(x_curr, soc_kf[i]);
+    }
+
     LevenbergMarquardtOptimizer optimizer(graph, initial);
     Values result = optimizer.optimize();
 
-    // 输出优化结果
-    cout << "优化后结果：" << endl;
-    result.print("结果");
+    string filename = fs::path(csv_path).stem().string();  // 提取文件名（无扩展名）
+    string outname = "estimated_SOC_fgo_" + filename + ".csv";
 
+    ofstream out(outname);
+    out << "time,SOC_fgo,SOC_kf,SOC_true\n";
+    for (size_t i = 0; i < N; ++i) {
+        Symbol xi('x', i);
+        out << time[i] << "," << result.at<double>(xi) << "," << soc_kf[i] << "," << soc_true[i] << "\n";
+    }
+    out.close();
+
+    cout << "✅ 结果已保存至: " << outname << endl;
     return 0;
 }
+
